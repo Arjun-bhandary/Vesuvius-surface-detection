@@ -1,0 +1,108 @@
+import torch
+from torch import nn
+import numpy as np
+import os
+import cupy as cp
+from cucim.skimage.morphology import skeletonize, binary_closing, ball
+from torch.utils.dlpack import to_dlpack, from_dlpack
+
+from nnunetv2.training.nnUNetTrainer.nnUNetTrainer import nnUNetTrainer
+from nnunetv2.training.loss.compound_losses import DC_and_CE_loss
+from nnunetv2.training.loss.dice import MemoryEfficientSoftDiceLoss
+from nnunetv2.training.loss.deep_supervision import DeepSupervisionWrapper
+from batchgenerators.utilities.file_and_folder_operations import join
+
+class SqueezePhaseLoss(nn.Module):
+    def __init__(self, nnunet_native_loss, weight_srec=0.4):
+        super().__init__()
+        self.native_loss = nnunet_native_loss
+        self.weight_srec = weight_srec
+        self.footprint = cp.asarray(ball(1)) 
+
+    def get_gpu_skeleton(self, gt_tensor):
+        with torch.no_grad():
+            gt_binary = (gt_tensor == 1).to(torch.uint8)
+            skel_results = torch.zeros_like(gt_binary)
+            for b in range(gt_binary.shape[0]):
+                vol_cp = cp.from_dlpack(to_dlpack(gt_binary[b, 0]))
+                closed_cp = binary_closing(vol_cp, footprint=self.footprint)
+                skel_cp = cp.zeros_like(closed_cp)
+                for z in range(closed_cp.shape[0]):
+                    if cp.any(closed_cp[z]):
+                        skel_cp[z] = skeletonize(closed_cp[z])
+                skel_results[b, 0] = from_dlpack(skel_cp.toDlpack())
+        return skel_results.float()
+
+    def forward(self, x, y):
+        # 1. Standard nnU-Net Loss (Applied to ALL scales)
+        l_native = self.native_loss(x, y)
+
+        # 2. Skeleton Recall (Applied ONLY to Scale 0 - Full Resolution)
+        # DeepSupervisionWrapper sends lists. Scale 0 is always index 0.
+        if isinstance(x, (list, tuple)):
+            pred_full_res = x[0]
+            target_full_res = y[0]
+        else:
+            pred_full_res = x
+            target_full_res = y
+
+        with torch.no_grad():
+            y_skel = self.get_gpu_skeleton(target_full_res)
+        
+        probs = torch.softmax(pred_full_res, dim=1)[:, 1].unsqueeze(1)
+        skel_sum = torch.sum(y_skel, dim=(2, 3, 4))
+        intersection = torch.sum(probs * y_skel, dim=(2, 3, 4))
+        
+        recall = (intersection + 1e-6) / (skel_sum + 1e-6)
+        l_skel = torch.mean(1.0 - recall[skel_sum > 0]) if torch.any(skel_sum > 0) else 0.0
+        
+        return (1 - self.weight_srec) * l_native + self.weight_srec * l_skel
+
+class nnUNetTrainer_SkelRecall(nnUNetTrainer):
+    def __init__(self, plans: dict, configuration: str, fold: int, dataset_json: dict, 
+                 unpack_dataset: bool = True, device: torch.device = torch.device('cuda')):
+        super().__init__(plans, configuration, fold, dataset_json, unpack_dataset, device)
+        
+        # --- Squeeze Hyperparameters ---
+        self.num_epochs = 100 
+        self.initial_lr = 1e-4 
+        self.batch_size = 4 
+        self.num_iterations_per_epoch = 250 
+        self.num_val_iterations_per_epoch = 1 
+
+    def initialize(self):
+        if not self.was_initialized:
+            super().initialize()
+            # Golden weight hijack
+            ckpt_path = join(self.output_folder, 'golden_weights_backup.pth')
+            if os.path.exists(ckpt_path):
+                self.print_to_log_file(f"RESUMING SQUEEZE FROM: {ckpt_path}")
+                checkpoint = torch.load(ckpt_path, map_location=self.device, weights_only=False)
+                self.network.load_state_dict(checkpoint['network_weights'], strict=False)
+            else:
+                self.print_to_log_file(f"WARNING: {ckpt_path} not found.")
+
+    def _build_loss(self):
+        native_loss = DC_and_CE_loss(
+            soft_dice_kwargs={'batch_dice': self.configuration_manager.batch_dice,
+                              'smooth': 1e-5, 'do_bg': False, 'ddp': self.is_ddp},
+            ce_kwargs={}, 
+            weight_ce=1, weight_dice=1,
+            ignore_label=self.label_manager.ignore_label, 
+            dice_class=MemoryEfficientSoftDiceLoss
+        )
+        
+        # Our custom loss wrapper
+        loss = SqueezePhaseLoss(native_loss, weight_srec=0.4)
+
+        if self.enable_deep_supervision:
+            deep_supervision_scales = self._get_deep_supervision_scales()
+            weights = np.array([1 / (2 ** i) for i in range(len(deep_supervision_scales))])
+            weights[-1] = 0 # Ignore lowest scale completely
+            loss = DeepSupervisionWrapper(loss, weights / weights.sum())
+        return loss
+
+    def on_epoch_end(self):
+        if (self.current_epoch + 1) % 10 == 0:
+            self.save_checkpoint(join(self.output_folder, f"checkpoint_epoch_{self.current_epoch + 1}.pth"))
+        super().on_epoch_end()
